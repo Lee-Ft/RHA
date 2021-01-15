@@ -31,7 +31,7 @@ else
     extra_args+=(${@:1})
 fi
 
-python main.py \
+python temp.py \
 --train_path ${train_path} \
 --valid_path ${valid_path} \
 --sub_path ${sub_path} \

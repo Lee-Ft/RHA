@@ -4,11 +4,10 @@ import torch.nn.functional as F
 import numpy as np
 import pprint
 from collections import defaultdict
-
-from context_query_attention import StructuredAttention
-from encoder import StackedEncoder
-from cnn import DepthwiseSeparableConv
-from model_utils import save_pickle, mask_logits, flat_list_of_lists, \
+from .context_query_attention import StructuredAttention
+from .encoder import StackedEncoder
+from .cnn import DepthwiseSeparableConv
+from .model_utils import save_pickle, mask_logits, flat_list_of_lists, \
     find_max_triples, get_high_iou_sapns, expand_span
 
 

@@ -20,15 +20,15 @@ class BaseOptions(object):
         self.parser.add_argument("--seed", type=int, default=2018, help="random seed")
 
         # training config
-        self.parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
+        self.parser.add_argument("--lr", type=float, default=5e-4, help="learning rate")
         self.parser.add_argument("--wd", type=float, default=3e-7, help="weight decay")
         self.parser.add_argument("--n_epoch", type=int, default=100, help="number of epochs to run")
         self.parser.add_argument("--max_es_cnt", type=int, default=5, help="number of epochs to early stop")
         self.parser.add_argument("--bsz", type=int, default=16, help="mini-batch size")
         self.parser.add_argument("--test_bsz", type=int, default=16, help="mini-batch size for testing")
         self.parser.add_argument("--device", type=int, default=0, help="0 cuda, -1 cpu")
-        self.parser.add_argument("--device_ids", type=int, nargs="+", default=[0], help="GPU ids to run the job")
-        self.parser.add_argument("--num_workers", type=int, default=2,
+        self.parser.add_argument("--device_ids", type=int, nargs="+", default=[3], help="GPU ids to run the job")
+        self.parser.add_argument("--num_workers", type=int, default=16,
                                  help="num subprocesses used to load the data, 0: use main process")
         self.parser.add_argument("--t_iter", type=int, default=0,
                                  help="positive integer, indicating #iterations for refine temporal prediction")
@@ -40,7 +40,7 @@ class BaseOptions(object):
         self.parser.add_argument("--ts_weight", type=float, default=0.5, help="temporal loss weight")
         self.parser.add_argument("--add_local", action="store_true",
                                  help="concat local feature with global feature for QA")
-        self.parser.add_argument("--input_streams", type=str, nargs="+", default=["sub", "vfeat"],
+        self.parser.add_argument("--input_streams", type=str, nargs="+", default=["sub", "vfeat", "vcpt"],
                                  choices=["vcpt", "sub", "vfeat", "joint_v"],
                                  help="input streams for the model, will use both `vcpt` and `sub` streams")
         self.parser.add_argument("--vfeat_type", type=str, help="video feature type",
@@ -115,6 +115,7 @@ class BaseOptions(object):
         self.parser.add_argument("--cls_encoder_kernel_size", type=int, default=5)
         self.parser.add_argument("--cls_encoder_n_heads", type=int, default=0,
                                  help="number of self-attention heads, 0: do not use it")
+        self.parser.add_argument("--inference_mode", action="store_true", default = False, help="turn off strict mode in load_state_dict")
 
         # paths
         self.parser.add_argument("--glove_path", type=str, default="data/glove.6B.300d.txt",
@@ -171,7 +172,9 @@ class BaseOptions(object):
             for arg in options:
                 if arg not in ["debug"]:
                     setattr(opt, arg, options[arg])
-            opt.no_core_driver = True
+            # opt.no_core_driver = True
+            opt.inference_mode = True
+            opt.test_path = "/home/data/tvqa_plus_stage_features/tvqa_plus_test_preprocessed_no_anno.json"
         else:
             mkdirp(opt.results_dir)
             # save a copy of current code

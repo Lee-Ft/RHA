@@ -11,10 +11,28 @@ from tensorboardX import SummaryWriter
 
 from utils import AverageMeter, count_parameters
 from model.stage import STAGE
-from model.trgat import TRGAT
-from tvqa_dataset import TVQADataset, pad_collate, prepare_inputs
+from model.trgat import TRGAT, get_att_loss
+from tvqa_dataset_new import TVQADataset, pad_collate, prepare_inputs
 from config import BaseOptions
 
+temporal_criterion = nn.CrossEntropyLoss(reduction="sum")
+def get_ts_loss(temporal_scores, ts_labels,  answer_indices):
+        """
+        Args:
+            temporal_scores: (N, 5, Li, 2)
+            ts_labels: dict(st=(N, ), ed=(N, ))
+            answer_indices: (N, )
+
+        Returns:
+
+        """
+        bsz = len(answer_indices)
+        # compute loss
+        ca_temporal_scores_st_ed = \
+            temporal_scores[torch.arange(bsz, dtype=torch.long), answer_indices]  # (N, Li, 2)
+        loss_st = temporal_criterion(ca_temporal_scores_st_ed[:, :, 0], ts_labels["st"])
+        loss_ed = temporal_criterion(ca_temporal_scores_st_ed[:, :, 1], ts_labels["ed"])
+        return (loss_st + loss_ed) / 2.
 
 def train(opt, dset, model, criterion, optimizer, epoch, previous_best_acc, use_hard_negatives=False):
     dset.set_mode("train")
@@ -48,13 +66,15 @@ def train(opt, dset, model, criterion, optimizer, epoch, previous_best_acc, use_
         timer_start = time.time()
         model_inputs, _, qids = prepare_inputs(batch, max_len_dict=max_len_dict, device=opt.device)
         prepare_inputs_time.update(time.time() - timer_start)
-        model_inputs.use_hard_negatives = use_hard_negatives
+        model_inputs["use_hard_negatives"] = use_hard_negatives
         try:
             timer_start = time.time()
             outputs, att_loss, _, temporal_loss, _ = model(model_inputs)
+            # outputs, targets, t_scores, vid_raw_s, temporal_loss, att_loss = model(model_inputs)
             outputs, targets = outputs
             att_loss = opt.att_weight * att_loss
             temporal_loss = opt.ts_weight * temporal_loss
+            # cls_loss = criterion(outputs, targets)
             cls_loss = criterion(outputs, targets)
             # keep the cls_loss at the same magnitude as only classifying batch_size objects
             cls_loss = cls_loss * (1.0 * len(qids) / len(targets))
@@ -71,6 +91,7 @@ def train(opt, dset, model, criterion, optimizer, epoch, previous_best_acc, use_
             train_loss_att.append(float(att_loss))
             train_loss_ts.append(float(temporal_loss))
             train_loss_cls.append(cls_loss.item())
+            # pred_ids = outputs.data.max(1)[1]
             pred_ids = outputs.data.max(1)[1]
             train_corrects += pred_ids.eq(targets.data).tolist()
         except RuntimeError as e:
@@ -167,9 +188,15 @@ def validate(opt, dset, model, criterion, mode="valid", use_hard_negatives=False
     )
     for val_idx, batch in enumerate(valid_loader):
         model_inputs, targets, qids = prepare_inputs(batch, max_len_dict=max_len_dict, device=opt.device)
-        model_inputs.use_hard_negatives = use_hard_negatives
+        model_inputs["use_hard_negatives"] = use_hard_negatives
         outputs, att_loss, _, temporal_loss, _ = model(model_inputs)
-        loss = criterion(outputs, targets) + opt.att_weight * att_loss + opt.ts_weight * temporal_loss
+        # outputs, targets, t_scores, vid_raw_s, temporal_loss, att_loss = model(model_inputs)
+
+        cls_loss = criterion(outputs, targets)
+        att_loss = opt.att_weight * att_loss
+        temporal_loss = opt.ts_weight * temporal_loss
+        # print(att_loss, temporal_loss)
+        loss = cls_loss + att_loss + temporal_loss
         # measure accuracy and record loss
         valid_qids += [int(x) for x in qids]
         valid_loss.append(loss.data.item())
@@ -193,9 +220,10 @@ def main():
 
     writer = SummaryWriter(opt.results_dir)
     opt.writer = writer
+    model = TRGAT(opt)
     dset = TVQADataset(opt)
     opt.vocab_size = len(dset.word2idx)
-    model = STAGE(opt)
+    
 
     count_parameters(model)
 
@@ -215,7 +243,7 @@ def main():
         optimizer,
         mode="max",
         factor=0.5,
-        patience=10,
+        patience=0,
         verbose=True
     )
 

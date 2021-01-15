@@ -7,8 +7,8 @@ __author__ = "Jie Lei"
 
 from collections import defaultdict
 import numpy as np
-from bounding_box import BoxList
-from boxlist_ops import boxlist_iou
+from .bounding_box import BoxList
+from .boxlist_ops import boxlist_iou
 
 
 def eval_detection_voc(pred_boxlists, gt_boxlists, iou_thresh=0.5, use_07_metric=False):
@@ -32,7 +32,7 @@ def eval_detection_voc(pred_boxlists, gt_boxlists, iou_thresh=0.5, use_07_metric
     rec = {k: v.tolist() for k, v in rec.items()}
     res = [{"ap": ap[k], "class_id": k, "precisions": prec[k], "recalls": rec[k],
             "n_tp": n_tp[k], "n_fp": n_fp[k], "n_positives": n_pos[k]} for k in ap.keys()]
-    return res, np.nanmean(ap.values())
+    return res, np.nanmean(list(ap.values()))
 
 
 def calc_detection_voc_prec_rec(gt_boxlists, pred_boxlists, iou_thresh=0.5):

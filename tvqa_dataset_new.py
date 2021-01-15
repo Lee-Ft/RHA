@@ -11,6 +11,7 @@ from easydict import EasyDict as edict
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
+from model.position_emb import build_graph, torch_broadcast_adj_matrix
 
 from utils import load_pickle, load_json, files_exist, get_all_img_ids, computeIoU, \
     flat_list_of_lists, match_stanford_tokenizer, load_glove, get_elements_variable_length, dissect_by_lengths
@@ -39,11 +40,14 @@ class TVQADataset(Dataset):
         self.raw_valid = load_json(opt.valid_path)
         self.sub_data = load_json(opt.sub_path)
         self.sub_flag = "sub" in opt.input_streams
+        
         self.vfeat_flag = "vfeat" in opt.input_streams
         self.vfeat_type = opt.vfeat_type
+        
         self.qa_bert_h5 = h5py.File(opt.qa_bert_path, "r", driver=opt.h5driver)  # qid + key
         if self.sub_flag:
             self.sub_bert_h5 = h5py.File(opt.sub_bert_path, "r", driver=opt.h5driver)  # vid_name
+        
         if self.vfeat_flag:
             self.vid_h5 = h5py.File(opt.vfeat_path, "r", driver=opt.h5driver)  # add core
         self.vcpt_flag = "vcpt" in opt.input_streams or self.vfeat_flag  # if vfeat, must vcpt
@@ -56,12 +60,14 @@ class TVQADataset(Dataset):
                 if opt.test_path:
                     self.raw_test = filter_list_dicts(self.raw_test, "vid_name", self.vcpt_dict.keys())
                 print("number of training/valid", len(self.raw_train), len(self.raw_valid))
+        
         self.glove_embedding_path = opt.glove_path
         self.mode = mode
         self.num_region = opt.num_region
         self.use_sup_att = opt.use_sup_att
         self.att_iou_thd = opt.att_iou_thd
         self.cur_data_dict = self.get_cur_dict()
+        # self.vcpt_mtx_dict = load_pickle(opt.vcpt_mtx_path)
 
         # tmp
         self.frm_cnt_path = opt.frm_cnt_path
@@ -70,23 +76,27 @@ class TVQADataset(Dataset):
         # build/load vocabulary
         self.word2idx_path = opt.word2idx_path
         self.embedding_dim = 300
+        # build initialized vocabulary
         self.word2idx = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
         self.idx2word = {0: "<pad>", 1: "<unk>", 2: "<eos>"}
         self.offset = len(self.word2idx)
+        self.vcpt_emb_dict = load_json("/home/data/tvqa_plus_stage_features/test.json")
         text_keys = ["a0", "a1", "a2", "a3", "a4", "q", "sub_text"]
+
+        # Build new vocabulary if word2idx.json not found
         if not files_exist([self.word2idx_path]):
             print("\nNo cache founded.")
             self.build_word_vocabulary(text_keys, word_count_threshold=2)
+        # Use the built word2inx.json
         else:
             print("\nLoading cache ...")
-            # self.word2idx = load_pickle(self.word2idx_path)
             self.word2idx = load_json(self.word2idx_path)
         self.idx2word = {i: w for w, i in self.word2idx.items()}
 
         self.eval_object_vocab = load_json(opt.eval_object_vocab_path)
         self.eval_object_word_ids = [self.word2idx[e] if e in self.word2idx else self.word2idx["<unk>"]
                                      for e in self.eval_object_vocab]
-
+    # Used in TVT stage
     def set_mode(self, mode):
         self.mode = mode
         self.inference = mode == "test"
@@ -97,15 +107,29 @@ class TVQADataset(Dataset):
             return self.raw_train
         elif self.mode == 'valid':
             return self.raw_valid
+        # self.mode == 'test'
         else:
-            return self.raw_test
+            if self.opt.test_path:
+                return self.raw_test
+            else:
+                raise NotImplementedError
 
     def __len__(self):
         return len(self.cur_data_dict)
 
     def __getitem__(self, index):
         # 0.5 fps mode
-        items = edict()
+        # A empty dict(Why not use self.cur_data_dict ?)
+        '''
+        : items.keys(): vid_name, qid, anno_st_idx, ts_label, ts, image_indices, boxes, target, q_l, qas, qas_bert, sub_bert, sub
+                        vcpt, object_labels, vfeat, att_labels
+        '''
+        '''
+        : item.keys(): vid_name, qid, anno_st_idx, ts_label, ts, image_indices, target, q_l, qas. qas_bert, question_bert,
+                        ans_emb, sub_bert, sub
+        '''
+        # items = edict()
+        items = {}
         items["vid_name"] = self.cur_data_dict[index]["vid_name"]
         vid_name = items["vid_name"]
         items["qid"] = self.cur_data_dict[index]["qid"]
@@ -128,14 +152,34 @@ class TVQADataset(Dataset):
             items["ts_label"], items["ts"] = [0, 0], None
         items["image_indices"] = (indices + 1).tolist()
         items["image_indices"] = items["image_indices"]
-
-        if self.mode in ["test", "valid"] and self.vfeat_flag:
+        
+        if self.mode in ["test", "valid", "train"] and self.vfeat_flag:
+            
             # add boxes
             boxes = self.vcpt_dict[vid_name]["boxes"]  # full resolution
             lowered_boxes = [boxes[idx][:self.num_region] for idx in indices]
-            items["boxes"] = lowered_boxes[start_idx:end_idx+1]
+            # items["boxes"] = lowered_boxes[start_idx:end_idx+1]
+            items["boxes"] = lowered_boxes
+            items["spa_adj_mtx"] = []
+            
+            for img in items["boxes"]:
+                xmax = 0
+                ymax = 0
+                for bbox in img:
+                    xmax = max(xmax, bbox[2])
+                    ymax = max(ymax, bbox[3])
+                spa_graph = build_graph(np.array(img), [xmax, ymax])
+                spa_adj_mtx = np.zeros((self.num_region, self.num_region)).tolist()
+                for i, raw in enumerate(spa_graph):
+                    spa_adj_mtx[i][:len(raw)] = raw
+                items["spa_adj_mtx"].append(spa_adj_mtx)
+            items["spa_adj_mtx"] = torch.tensor(items["spa_adj_mtx"], requires_grad=True)
+            items["spa_adj_mtx"] = torch_broadcast_adj_matrix(items["spa_adj_mtx"])
+
         else:
             items["boxes"] = None
+
+        
 
         if "answer_idx" in self.cur_data_dict[index]:
             # add correct answer
@@ -156,6 +200,11 @@ class TVQADataset(Dataset):
         items["q_l"] = q_l
         items["qas"] = qa_sentences
         items["qas_bert"] = qa_sentences_bert
+
+        # Answer embedding and question embedding
+        items["ans_emb"] = [torch.from_numpy(np.array(self.qa_bert_h5[str(qid) + "_" + k])) for k in answer_keys]
+        question_bert = torch.from_numpy(np.array(self.qa_bert_h5[str(qid) + "_q"]))
+        items["question_bert"] = question_bert
 
         # add sub
         if self.sub_flag:
@@ -180,12 +229,12 @@ class TVQADataset(Dataset):
         else:
             items["sub_bert"] = [torch.zeros(2, 2)] * 2
             items["sub"] = [torch.zeros(2, 2)] * 2
-
+        
         if self.vfeat_flag or self.vcpt_flag:
             region_counts = self.vcpt_dict[vid_name]["counts"]  # full resolution
             localized_lowered_region_counts = \
                 [min(region_counts[idx], self.num_region) for idx in indices][start_idx:end_idx+1]
-
+        
         # add vcpt
         if self.vcpt_flag:
             lower_res_obj_labels = get_elements_variable_length(
@@ -193,22 +242,13 @@ class TVQADataset(Dataset):
             obj_labels = lower_res_obj_labels
             items["vcpt"] = self.numericalize_hier_vcpt(obj_labels)
             items["object_labels"] = obj_labels
+            items["vcpt_emb"] = []
+            for img in obj_labels:
+                tmp = [self.vcpt_emb_dict[obj_label.split()[-1]] for obj_label in img]
+                items["vcpt_emb"].append(torch.tensor(tmp))
+            
         else:
             items["vcpt"] = [[0, 0], [0, 0]]
-
-        # if self.vcpt_flag:
-        #     lower_res_obj_labels = get_elements_variable_length(
-        #         self.vcpt_dict[vid_name]["object"], indices, cnt_list=None, max_num_region=self.num_region)
-        #     obj_labels = lower_res_obj_labels
-        #     items["vcpt"] = self.numericalize_hier_vcpt(obj_labels)
-        #     items["object_labels"] = obj_labels
-        #     items["vcpt_emb"] = []
-        #     for img in obj_labels:
-        #         tmp = [self.vcpt_emb_dict[obj_label.split()[-1]] for obj_label in img]
-        #         items["vcpt_emb"].append(torch.tensor(tmp))
-            
-        # else:
-        #     items["vcpt"] = [[0, 0], [0, 0]]
 
         # add visual feature
         if self.vfeat_flag:
@@ -217,9 +257,11 @@ class TVQADataset(Dataset):
             cur_vfeat = lowered_vfeat
 
             items["vfeat"] = [torch.from_numpy(e) for e in cur_vfeat]
+            items["imp_adj_mtx"] = [torch.ones(self.num_region, self.num_region, 1, requires_grad = True) for e in cur_vfeat]
+            # print(items["imp_adj_mtx"].shape)
         else:
             items["vfeat"] = [torch.zeros(2, 2)] * 2
-
+        
         # add att
         if "answer_idx" in self.cur_data_dict[index] and self.use_sup_att and not self.inference and self.vfeat_flag:
             q_ca_sentence = self.cur_data_dict[index]["q"] + " " + \
@@ -230,6 +272,9 @@ class TVQADataset(Dataset):
                 iou_thd=self.att_iou_thd, single_box=self.inference)
         else:
             items["att_labels"] = [torch.zeros(2, 2, 2)] * 2
+
+        
+        
         return items
 
     @classmethod
@@ -604,7 +649,8 @@ def pad_collate(data):
     """Creates mini-batch tensors from the list of tuples (src_seq, trg_seq).
     """
     # separate source and target sequences
-    batch = edict()
+    # batch = edict()
+    batch = {}
     batch["qas"], batch["qas_mask"] = pad_sequences_2d([d["qas"] for d in data], dtype=torch.long)
     batch["qas_bert"], _ = pad_sequences_2d([d["qas_bert"] for d in data], dtype=torch.float)
     batch["sub"], batch["sub_mask"] = pad_sequences_2d([d["sub"] for d in data], dtype=torch.long)
@@ -612,11 +658,13 @@ def pad_collate(data):
     batch["vid_name"] = [d["vid_name"] for d in data]
     batch["qid"] = [d["qid"] for d in data]
     batch["target"] = torch.tensor([d["target"] for d in data], dtype=torch.long)
+    
     batch["vcpt"], batch["vcpt_mask"] = pad_sequences_2d([d["vcpt"] for d in data], dtype=torch.long)
     batch["vid"], batch["vid_mask"] = pad_sequences_2d([d["vfeat"] for d in data], dtype=torch.float)
     # no need to pad these two, since we will break down to instances anyway
     batch["att_labels"] = [d["att_labels"] for d in data]  # a list, each will be (num_img, num_words)
     batch["anno_st_idx"] = [d["anno_st_idx"] for d in data]  # list(int)
+    
     if data[0]["ts_label"] is None:
         batch["ts_label"] = None
     elif isinstance(data[0]["ts_label"], list):  # (st_ed, ce)
@@ -633,22 +681,110 @@ def pad_collate(data):
     batch["ts"] = [d["ts"] for d in data]
     batch["image_indices"] = [d["image_indices"] for d in data]
     batch["q_l"] = [d["q_l"] for d in data]
-
+    
+    
     batch["boxes"] = [d["boxes"] for d in data]
-    batch["object_labels"] = [d["object_labels"] for d in data]
+
+    batch["imp_adj_mtx"], _ = pad_sequences_2d([d["imp_adj_mtx"] for d in data], dtype = torch.int)
+    batch["vcpt_emb"], batch["vcpt_emb_mask"] = pad_sequences_2d([d["vcpt_emb"] for d in data], dtype = torch.float)
+    batch["spa_adj_mtx"], _ = pad_sequences_2d([d["spa_adj_mtx"] for d in data], dtype=torch.int)
+
+    if "object_labels" in data[0].keys():
+        batch["object_labels"] = [d["object_labels"] for d in data]
+    
+    # New items
+    batch["question_bert"], _ = pad_sequences_1d([d["question_bert"] for d in data], dtype = torch.float)
+    max_q_len = int(batch["question_bert"].size(1))
+    max_s_len = int(batch["sub_bert"].size(1))
+    max_qas_len = int(batch["qas_bert"].size(1))
+    batch_size = len(data)
+    batch["q_len"] = torch.tensor([d["q_l"] for d in data], dtype = torch.int)
+
+    batch["q_adj"] = torch.ones(len(data), max_q_len, max_q_len)
+    batch["s_adj"] = torch.ones(len(data), max_s_len, max_s_len)
+    batch["qa_adj"] = torch.ones(len(data), max_qas_len, max_qas_len)
+    batch["i_adj"] = torch.ones(len(data), 25, 25)
+    batch["ans_emb"], _ = pad_sequences_2d([d["ans_emb"] for d in data], dtype= torch.float)
+
     return batch
 
 
 def prepare_inputs(batch, max_len_dict=None, device="cuda"):
     """clip and move input data to gpu"""
-    model_in_dict = edict()
+    model_in_dict = {}
 
     # qas (B, 5, #words, D)
     max_qa_l = min(batch["qas"].shape[2], max_len_dict["max_qa_l"])
     model_in_dict["qas"] = batch["qas"][:, :, :max_qa_l].to(device)
     model_in_dict["qas_bert"] = batch["qas_bert"][:, :, :max_qa_l].to(device)
     model_in_dict["qas_mask"] = batch["qas_mask"][:, :, :max_qa_l].to(device)
+    #model_in_dict["question_bert"] = batch["question_bert"][:, :, :max_qa_l].to(device)
+    # (B, #imgs, #words, D)
+    model_in_dict["sub"] = batch["sub"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_sub_l"]].to(device)
+    model_in_dict["sub_bert"] = batch["sub_bert"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_sub_l"]].to(device)
+    model_in_dict["sub_mask"] = batch["sub_mask"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_sub_l"]].to(device)
 
+    # context, vid (B, #imgs, #regions, D), vcpt (B, #imgs, #regions)
+    ctx_keys = ["vid", "vcpt"]
+    for k in ctx_keys:
+        max_l = min(batch[k].shape[1], max_len_dict["max_{}_l".format(k)])
+        model_in_dict[k] = batch[k][:, :max_l].to(device)
+        mask_key = "{}_mask".format(k)
+        model_in_dict[mask_key] = batch[mask_key][:, :max_l].to(device)
+
+    # att_label (B, #imgs, #qa_words, #regions)
+    max_att_imgs = min(max([len(d) for d in batch["att_labels"]]), max_len_dict["max_vid_l"])
+    max_att_words = min(max([d[0].shape[0] for d in batch["att_labels"]]), max_len_dict["max_qa_l"])
+    model_in_dict["att_labels"] = [[inner_d[:max_att_words].to(device) for inner_d in d[:max_att_imgs]]
+                                   for d in batch["att_labels"]]
+    model_in_dict["anno_st_idx"] = batch["anno_st_idx"]
+
+    if batch["ts_label"] is None:
+        model_in_dict["ts_label"] = None
+        model_in_dict["ts_label_mask"] = None
+    elif isinstance(batch["ts_label"], dict):  # (st_ed, ce)
+        model_in_dict["ts_label"] = dict(
+            st=batch["ts_label"]["st"].to(device),
+            ed=batch["ts_label"]["ed"].to(device),
+        )
+        model_in_dict["ts_label_mask"] = batch["ts_label_mask"][:, :max_len_dict["max_vid_l"]].to(device)
+    else:  # frm-wise or (st_ed, bce)
+        model_in_dict["ts_label"] = batch["ts_label"][:, :max_len_dict["max_vid_l"]].to(device)
+        model_in_dict["ts_label_mask"] = batch["ts_label_mask"][:, :max_len_dict["max_vid_l"]].to(device)
+
+    # target
+    model_in_dict["target"] = batch["target"].to(device)
+
+    # others
+    model_in_dict["qid"] = batch["qid"]
+    model_in_dict["vid_name"] = batch["vid_name"]
+
+    targets = model_in_dict["target"]
+    qids = model_in_dict["qid"]
+    model_in_dict["ts"] = batch["ts"]
+    model_in_dict["q_l"] = batch["q_l"]
+    model_in_dict["image_indices"] = batch["image_indices"]
+    model_in_dict["boxes"] = batch["boxes"]
+    model_in_dict["spa_adj_mtx"] = batch["spa_adj_mtx"].to(device)
+    model_in_dict["imp_adj_mtx"] = batch["imp_adj_mtx"].to(device)
+    if "object_labels" in batch.keys():
+        model_in_dict["object_labels"] = batch["object_labels"]
+    model_in_dict["question_bert"] = batch["question_bert"].to(device)
+    model_in_dict["ans_emb"] = batch["ans_emb"].to(device)
+    model_in_dict["vcpt_emb"] = batch["vcpt_emb"].to(device)
+    model_in_dict["sub_emb"] = batch["sub_bert"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_vid_l"]].to(device)
+    return model_in_dict, targets, qids
+
+def prepare_inputs_back(batch, max_len_dict=None, device="cuda"):
+    """clip and move input data to gpu"""
+    # model_in_dict = edict()
+    model_in_dict = {}
+    # qas (B, 5, #words, D)
+    max_qa_l = min(batch["qas"].shape[2], max_len_dict["max_qa_l"])
+    model_in_dict["qas"] = batch["qas"][:, :, :max_qa_l].to(device)
+    model_in_dict["qas_bert"] = batch["qas_bert"][:, :, :max_qa_l].to(device)
+    model_in_dict["qas_mask"] = batch["qas_mask"][:, :, :max_qa_l].to(device)
+    #model_in_dict["question_bert"] = batch["question_bert"][:, :, :max_qa_l].to(device)
     # (B, #imgs, #words, D)
     model_in_dict["sub"] = batch["sub"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_sub_l"]].to(device)
     model_in_dict["sub_bert"] = batch["sub_bert"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_sub_l"]].to(device)
@@ -696,8 +832,11 @@ def prepare_inputs(batch, max_len_dict=None, device="cuda"):
     model_in_dict["image_indices"] = batch["image_indices"]
     model_in_dict["boxes"] = batch["boxes"]
     model_in_dict["object_labels"] = batch["object_labels"]
+    model_in_dict["question_bert"] = batch["question_bert"].to(device)
+    model_in_dict["ans_emb"] = batch["ans_emb"].to(device)
+   
+    model_in_dict["sub_emb"] = batch["sub_bert"][:, :max_len_dict["max_vid_l"], :max_len_dict["max_vid_l"]].to(device)
     return model_in_dict, targets, qids
-
 
 def find_match(subtime, time_array, mode="larger"):
     """find closet value in an array to a given value

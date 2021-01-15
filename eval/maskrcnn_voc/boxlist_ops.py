@@ -2,7 +2,7 @@
 # import torch
 import numpy as np
 
-from bounding_box import BoxList
+from .bounding_box import BoxList
 
 
 # implementation from https://github.com/kuangliu/torchcv/blob/master/torchcv/utils/box.py

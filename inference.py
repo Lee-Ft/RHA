@@ -5,7 +5,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model.stage import STAGE
-from tvqa_dataset import TVQADataset, pad_collate, prepare_inputs
+from model.trgat import TRGAT
+from tvqa_dataset_new import TVQADataset, pad_collate, prepare_inputs
 from config import TestOptions
 from utils import save_json_pretty, merge_dicts, save_json
 
@@ -29,15 +30,53 @@ def find_max_pair(p1, p2):
             val1 = p1[i]
 
         val2 = p2[i]
-        if val1 * val2 > max_val:
+        if float(val1) * float(val2) > max_val:
             best_span = (argmax_k1, i)
             max_val = val1 * val2
     return best_span, float(max_val)
 
+# def inference(opt, dset, model):
+#     dset.set_mode(opt.mode)
+#     data_loader = DataLoader(dset, batch_size=opt.test_bsz, shuffle=False, collate_fn=pad_collate)
+
+#     predictions = dict(ts_answer={}, raw_bbox=[])
+#     max_len_dict = dict(
+#         max_sub_l=opt.max_sub_l,
+#         max_vid_l=opt.max_vid_l,
+#         max_vcpt_l=opt.max_vcpt_l,
+#         max_qa_l=opt.max_qa_l,
+#     )
+#     for valid_idx, batch in tqdm(enumerate(data_loader)):
+#         model_inputs, targets, qids = prepare_inputs(batch, max_len_dict=max_len_dict, device=opt.device)
+#         model_inputs["use_hard_negatives"] = False
+#         model_inputs["eval_object_word_ids"] = dset.eval_object_word_ids  # so we know which words need boxes.
+
+#         inference_outputs = model(model_inputs)
+#         # predicted answers
+#         pred_ids = inference_outputs["answer"].data.max(1)[1]
+
+#         # predicted regions
+#         if inference_outputs["att_predictions"]:
+#             predictions["raw_bbox"] += inference_outputs["att_predictions"]
+
+#         temporal_predictions = inference_outputs["t_scores"]
+#         for qid, pred_a_idx, temporal_score_st, temporal_score_ed, img_indices in \
+#                 zip(qids, pred_ids.tolist(),
+#                     temporal_predictions[:, :, :, 0],
+#                     temporal_predictions[:, :, :, 1],
+#                     model_inputs["image_indices"]):
+#             offset = (img_indices[0] % 6) / 3
+#             (st, ed), _ = find_max_pair(temporal_score_st[pred_a_idx].cpu().numpy().tolist(),
+#                                         temporal_score_ed[pred_a_idx].cpu().numpy().tolist())
+#             # [[st, ed], pred_ans_idx], note that [st, ed] is associated with the predicted answer.
+#             predictions["ts_answer"][str(qid)] = [[st * 2 + offset, (ed + 1) * 2 + offset], int(pred_a_idx)]
+#         if opt.debug:
+#             break
+#     return predictions
 
 def inference(opt, dset, model):
     dset.set_mode(opt.mode)
-    data_loader = DataLoader(dset, batch_size=opt.test_bsz, shuffle=False, collate_fn=pad_collate)
+    data_loader = DataLoader(dset, batch_size=opt.test_bsz, shuffle=False, collate_fn=pad_collate, num_workers=opt.num_workers)
 
     predictions = dict(ts_answer={}, raw_bbox=[])
     max_len_dict = dict(
@@ -48,18 +87,20 @@ def inference(opt, dset, model):
     )
     for valid_idx, batch in tqdm(enumerate(data_loader)):
         model_inputs, targets, qids = prepare_inputs(batch, max_len_dict=max_len_dict, device=opt.device)
-        model_inputs.use_hard_negatives = False
-        model_inputs.eval_object_word_ids = dset.eval_object_word_ids  # so we know which words need boxes.
+        model_inputs["use_hard_negatives"] = False
+        model_inputs["eval_object_word_ids"] = dset.eval_object_word_ids  # so we know which words need boxes.
 
-        inference_outputs = model(model_inputs)
+        # inference_outputs = model(model_inputs)
+        pred_ids, temporal_predictions = model(model_inputs)
         # predicted answers
-        pred_ids = inference_outputs["answer"].data.max(1)[1]
-
+        # pred_ids = inference_outputs["answer"].data.max(1)[1]
+        pred_ids = pred_ids.data.max(1)[1]
+        # predictions["raw_bbox"] += att_predictions
         # predicted regions
-        if inference_outputs["att_predictions"]:
-            predictions["raw_bbox"] += inference_outputs["att_predictions"]
+        # if inference_outputs["att_predictions"]:
+        #     predictions["raw_bbox"] += inference_outputs["att_predictions"]
 
-        temporal_predictions = inference_outputs["t_scores"]
+        # temporal_predictions = inference_outputs["t_scores"]
         for qid, pred_a_idx, temporal_score_st, temporal_score_ed, img_indices in \
                 zip(qids, pred_ids.tolist(),
                     temporal_predictions[:, :, :, 0],
@@ -78,12 +119,17 @@ def inference(opt, dset, model):
 def main_inference():
     print("Loading config...")
     opt = TestOptions().parse()
+    print("Loading model...")
+    model = TRGAT(opt)
     print("Loading dataset...")
     dset = TVQADataset(opt, mode=opt.mode)
-    print("Loading model...")
-    model = STAGE(opt)
     model.to(opt.device)
-    cudnn.benchmark = True
+    if opt.device.type == "cuda":
+        print("CUDA enabled.")
+        if len(opt.device_ids) > 1:
+            print("Use multi GPU", opt.device_ids)
+            model = torch.nn.DataParallel(model, device_ids=opt.device_ids)  # use multi GPU
+    # cudnn.benchmark = True
     strict_mode = not opt.no_strict
     model_path = os.path.join("results", opt.model_dir, "best_valid.pth")
     model.load_state_dict(torch.load(model_path), strict=strict_mode)

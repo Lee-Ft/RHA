@@ -40,7 +40,7 @@ def compute_temporal_metrics(pred_dict, gt_dict):
         iou_array (list of float):
     """
     keys = sorted(pred_dict.keys())
-    gt_key_type = type(gt_dict.keys()[0])  # in case the two dicts has differnt key types
+    gt_key_type = type(list(gt_dict.keys())[0])  # in case the two dicts has differnt key types
 
     pred_ts = [pred_dict[k][0] for k in keys]  # (N, 2) # [st, ed]
     gt_ts = [gt_dict[gt_key_type(k)][0] for k in keys]  # (N, 2) # [st, ed]

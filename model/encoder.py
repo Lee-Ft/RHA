@@ -1,9 +1,9 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
-from position_encoding import PositionEncoding
-from cnn import DepthwiseSeparableConv
-from self_attention import MultiHeadedAttention
+from .position_encoding import PositionEncoding
+from .cnn import DepthwiseSeparableConv
+from .self_attention import MultiHeadedAttention
 
 
 class EncoderBlock(nn.Module):

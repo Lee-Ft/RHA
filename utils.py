@@ -13,7 +13,8 @@ try:
     import cPickle as pickle
 except:
     import pickle
-
+from model.position_emb import build_graph, torch_broadcast_adj_matrix
+import torch
 
 def save_json(data, file_path):
     with open(file_path, "w") as f:
@@ -33,7 +34,7 @@ def load_json(file_path):
 
 def save_pickle(data, data_path, highest=False):
     protocol = 2 if highest else 0
-    with open(data_path, "w") as f:
+    with open(data_path, "wb") as f:
         pickle.dump(data, f, protocol=protocol)
 
 
@@ -521,3 +522,67 @@ def computeIoU(box1, box2):
     union = (box1[2] - box1[0]) * (box1[3] - box1[1]) + (box2[2] - box2[0]) * (box2[3] - box2[1]) - inter
     return float(inter)/union
 
+def get_vcpt_adj_mtx():
+    
+    data_path = "/home/data/tvqa_plus_stage_features/spa_adj_mtx_test.pickle"
+    train_path = "/home/data/tvqa_plus_stage_features/tvqa_plus_train_preprocessed.json"
+    val_path= "/home/data/tvqa_plus_stage_features/tvqa_plus_valid_preprocessed.json"
+    test_path= "/home/data/tvqa_plus_stage_features/tvqa_plus_test_preprocessed_no_anno.json"
+    vcpt_path = "/home/data/tvqa_plus_stage_features/tvqa_bbt_frcn_vg_hq_20_100.json"
+    frm_cnt_path = "/home/data/tvqa_plus_stage_features/frm_cnt_cache.json"
+    num_region = 25
+    cur_data_dict_train = load_json(train_path)
+    cur_data_dict_val = load_json(val_path)
+    cur_data_dict_test = load_json(test_path)
+    vcpt_dict = load_pickle(vcpt_path) if vcpt_path.endswith(".pickle") \
+                else load_json(vcpt_path)
+    frm_cnt_dict = load_json(frm_cnt_path)
+    adj_dict = {}
+
+    # for cur_data_dict in [cur_data_dict_train, cur_data_dict_val, cur_data_dict_test]:
+    for cur_data_dict in [cur_data_dict_val]:
+        print(len(cur_data_dict))
+        for index, _ in enumerate(cur_data_dict):
+
+            vid_name = cur_data_dict[index]["vid_name"]
+            print(index, vid_name)
+            qid = cur_data_dict[index]["qid"]
+
+            frm_cnt = frm_cnt_dict[vid_name]
+            located_img_ids = sorted([int(e) for e in cur_data_dict[index]["bbox"].keys()])
+            start_img_id, end_img_id = located_img_ids[0], located_img_ids[-1]
+            indices, start_idx, end_idx = get_all_img_ids(start_img_id, end_img_id, frm_cnt, frame_interval=6)
+            indices = np.array(indices) - 1  # since the frame (image) index from 1
+
+            boxes = vcpt_dict[vid_name]["boxes"]  # full resolution
+            lowered_boxes = [boxes[idx][:num_region] for idx in indices]
+            items = []
+            for img in lowered_boxes:
+                xmax = 0
+                ymax = 0
+                for bbox in img:
+                    xmax = max(xmax, bbox[2])
+                    ymax = max(ymax, bbox[3])
+                spa_graph = build_graph(np.array(img), [xmax, ymax])
+                spa_adj_mtx = np.zeros((num_region, num_region)).tolist()
+                for i, raw in enumerate(spa_graph):
+                    spa_adj_mtx[i][:len(raw)] = raw
+                items.append(spa_adj_mtx)
+            items = torch.tensor(items, type = int)
+            items = torch_broadcast_adj_matrix(items)
+            qa_index = str(vid_name) + "_" + str(qid)
+            adj_dict[qa_index] = items
+
+    save_pickle(adj_dict, data_path, highest=False)
+
+
+def concat_json(json_list, out):
+    full_data = []
+    for file_name in json_list:
+        temp_data = load_json(file_name)
+        full_data = full_data + temp_data
+        print(len(temp_data))
+    print(len(full_data))
+    save_json(full_data, out)
+
+    return True
